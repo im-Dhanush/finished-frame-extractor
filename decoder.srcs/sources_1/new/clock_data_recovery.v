@@ -18,8 +18,6 @@
 // Additional Comments:
 // 
 //////////////////////////////////////////////////////////////////////////////////
-
-
 module clock_data_recovery (
     input  wire  sample_clk,
     input  wire  arst_n,
@@ -31,55 +29,37 @@ module clock_data_recovery (
     output reg   bit_error
 );
 
-    // -------------------------------------------------------------------------
-    // Internal wires connecting sub-blocks
-    // -------------------------------------------------------------------------
     wire mdi_sync;
     wire lock;
     wire detect_one;
     wire detect_zero;
     wire bit_error_raw;
 
-    // =========================================================================
-    // 1. Synchronizer
-    // =========================================================================
     synchronizer u_synchronizer (
-        .sample_clk ( sample_clk ),
-        .arst_n     ( arst_n     ),
-        .mdi        ( mdi        ),
-        .mdi_sync   ( mdi_sync   )
+        .sample_clk (sample_clk),
+        .arst_n     (arst_n),
+        .mdi        (mdi),
+        .mdi_sync   (mdi_sync)
     );
 
-    // =========================================================================
-    // 2. CDR FSM
-    // =========================================================================
     cdr_fsm u_cdr_fsm (
-        .sample_clk   ( sample_clk   ),
-        .arst_n       ( arst_n       ),
-        .start_decode ( start_decode ),
-        .mdi_sync     ( mdi_sync     ),
-        .lock         ( lock         )
+        .sample_clk   (sample_clk),
+        .arst_n       (arst_n),
+        .start_decode (start_decode),
+        .mdi_sync     (mdi_sync),
+        .lock         (lock)
     );
 
-    // =========================================================================
-    // 3. Data Sampling & Comparison Logic
-    // =========================================================================
     data_sampling_comparison u_data_sampling (
-        .sample_clk  ( sample_clk  ),
-        .arst_n      ( arst_n      ),
-        .mdi_sync    ( mdi_sync    ),
-        .detect_one  ( detect_one  ),
-        .detect_zero ( detect_zero ),
-        .bit_error   ( bit_error_raw )
+        .sample_clk  (sample_clk),
+        .arst_n      (arst_n),
+        .mdi_sync    (mdi_sync),
+        .detect_one  (detect_one),
+        .detect_zero (detect_zero),
+        .bit_error   (bit_error_raw)
     );
 
-    // =========================================================================
-    // 4. MUX / Output Gate
-    // =========================================================================
-
-    // -- Step 1: rising-edge detector on (detect_one | detect_zero) -----------
-    //    Fires on the first sample_clk cycle that a clean transition pattern
-    //    first enters the 12-bit jitter window.
+    // -- Rising-edge detector on detect_valid --------------------------------
     reg  detect_valid_d;
     wire detect_valid = detect_one | detect_zero;
 
@@ -90,23 +70,29 @@ module clock_data_recovery (
 
     wire bit_pulse_raw = detect_valid & ~detect_valid_d;
 
-    
-    reg [4:0] blank_cnt;                              // 5 bits covers 0..24
-    wire      blanking = (blank_cnt != 5'd0);
+    // -- Blanking counter ----------------------------------------------------
+    // FIX: was 5'd24. Correct value = 10.
+    // Timing proof (cycles measured from start of current bit):
+    //   bit_pulse fires at cycle 18. blank_cnt reloaded to 10.
+    //   Same-value boundary detect at cycle 25: 10-(25-18)=3 → suppressed ✓
+    //   Next bit centre detect    at cycle 33: 10-(33-18)=-5 → expired  ✓
+    //   With ±2 jitter: boundary at 23: 10-5=5 suppressed ✓
+    //                   centre  at 35: 10-17=-7 expired ✓
+    reg [3:0] blank_cnt;                      // 4 bits covers 0..10
+    wire      blanking = (blank_cnt != 4'd0);
 
     always @(posedge sample_clk or negedge arst_n) begin
         if (!arst_n)
-            blank_cnt <= 5'd0;
-        else if (bit_pulse_raw & ~blanking)           // new un-blanked pulse
-            blank_cnt <= 5'd24;                       // reload blanking window
-        else if (blank_cnt != 5'd0)
-            blank_cnt <= blank_cnt - 5'd1;            // count down
+            blank_cnt <= 4'd0;
+        else if (bit_pulse_raw & ~blanking)
+            blank_cnt <= 4'd10;              // FIX: was 5'd24
+        else if (blank_cnt != 4'd0)
+            blank_cnt <= blank_cnt - 4'd1;
     end
 
-    // Gated bit pulse: exactly one pulse per Manchester bit cell
     wire bit_pulse = bit_pulse_raw & ~blanking;
 
-    // -- Step 3: registered MUX outputs ---------------------------------------
+    // -- Output register -----------------------------------------------------
     always @(posedge sample_clk or negedge arst_n) begin
         if (!arst_n) begin
             recovered_clock     <= 1'b0;
@@ -114,9 +100,13 @@ module clock_data_recovery (
             bit_error           <= 1'b0;
         end else begin
             if (lock) begin
-                recovered_clock     <= bit_pulse;     // 1-cycle pulse per bit
-                retimed_serial_data <= detect_one;    // '1' on 0→1, '0' on 1→0
-                bit_error           <= bit_error_raw;
+                recovered_clock <= bit_pulse;
+                if (bit_pulse)
+                    retimed_serial_data <= detect_one;
+                // FIX: bit_error registered every cycle, not gated by bit_pulse.
+                // A jittered bit never fires bit_pulse (detect_valid stays 0),
+                // so gating by bit_pulse means bit_error is never sampled.
+                bit_error <= bit_error_raw;
             end else begin
                 recovered_clock     <= 1'b0;
                 retimed_serial_data <= 1'b0;
